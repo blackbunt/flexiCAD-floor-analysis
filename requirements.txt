@@ -1,0 +1,5 @@
+ezdxf
+matplotlib
+numpy
+scipy
+reportlab
