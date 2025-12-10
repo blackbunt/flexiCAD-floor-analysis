@@ -27,7 +27,7 @@ from scipy.interpolate import griddata
 # =============================================================================
 
 # Pfad zur DXF-Eingabedatei
-INPUT_DXF = "Boden.dxf"
+INPUT_DXF = "Boden-links.dxf"
 
 # Ausgabeverzeichnis (wird erstellt falls nicht vorhanden)
 OUTPUT_DIR = "ausgabe"
@@ -37,6 +37,10 @@ SCHWELLE = 2.0  # Empfehlung: 1.0 = sehr genau, 2.0 = Standard, 3.0 = tolerant
 
 # Suchradius für lokale Referenz in mm
 RADIUS = 400  # Empfehlung: 400mm bei 10cm Raster
+
+# Referenzwand und Nullpunkt-Ecke festlegen
+REFERENCE_WALL = "S"  # N = Nord (höchstes Y), S = Süd (niedrigstes Y), E = Ost (höchstes X), W = West (niedrigstes X)
+ORIGIN_CORNER = "SW"  # NE = Nordost, NW = Nordwest, SE = Südost, SW = Südwest
 
 # Ausgabeformate aktivieren/deaktivieren
 EXPORT_PNG = True
@@ -113,14 +117,139 @@ def load_dxf(filepath):
     
     # Grundriss (Linien) extrahieren
     lines = []
+    
+    # LINE Entities
     for entity in msp.query('LINE'):
         start = (entity.dxf.start.x, entity.dxf.start.y)
         end = (entity.dxf.end.x, entity.dxf.end.y)
         lines.append((start, end))
     
+    # LWPOLYLINE Entities (Lightweight Polylines)
+    for entity in msp.query('LWPOLYLINE'):
+        vertices = list(entity.vertices())
+        for i in range(len(vertices) - 1):
+            start = (float(vertices[i][0]), float(vertices[i][1]))
+            end = (float(vertices[i+1][0]), float(vertices[i+1][1]))
+            lines.append((start, end))
+        # Wenn geschlossen, verbinde letzten mit erstem Punkt
+        if entity.closed and len(vertices) > 2:
+            start = (float(vertices[-1][0]), float(vertices[-1][1]))
+            end = (float(vertices[0][0]), float(vertices[0][1]))
+            lines.append((start, end))
+    
+    # POLYLINE Entities
+    for entity in msp.query('POLYLINE'):
+        vertices = list(entity.vertices())
+        for i in range(len(vertices) - 1):
+            start = (vertices[i].dxf.location.x, vertices[i].dxf.location.y)
+            end = (vertices[i+1].dxf.location.x, vertices[i+1].dxf.location.y)
+            lines.append((start, end))
+        # Wenn geschlossen, verbinde letzten mit erstem Punkt
+        if entity.is_closed and len(vertices) > 2:
+            start = (vertices[-1].dxf.location.x, vertices[-1].dxf.location.y)
+            end = (vertices[0].dxf.location.x, vertices[0].dxf.location.y)
+            lines.append((start, end))
+    
     print(f"  → {len(lines)} Grundrisslinien gefunden")
     
     return points, lines
+
+
+def find_north_wall(lines):
+    """
+    Findet die Nordwand (Linie mit höchstem Y) für die Referenz-Beschriftung.
+    Verändert KEINE Koordinaten, gibt nur Referenzinformationen zurück.
+    """
+    if len(lines) == 0:
+        return None
+    
+    # Finde Referenzwand basierend auf REFERENCE_WALL Parameter
+    wall_name_map = {
+        'N': 'Nord (höchstes Y)',
+        'S': 'Süd (niedrigstes Y)',
+        'E': 'Ost (höchstes X)',
+        'W': 'West (niedrigstes X)'
+    }
+    
+    if REFERENCE_WALL == 'N':
+        # Nordwand: höchstes durchschnittliches Y
+        target_val = max(lines, key=lambda line: (line[0][1] + line[1][1]) / 2)
+        ref_wall = target_val
+    elif REFERENCE_WALL == 'S':
+        # Südwand: niedrigstes durchschnittliches Y
+        target_val = min(lines, key=lambda line: (line[0][1] + line[1][1]) / 2)
+        ref_wall = target_val
+    elif REFERENCE_WALL == 'E':
+        # Ostwand: höchstes durchschnittliches X
+        target_val = max(lines, key=lambda line: (line[0][0] + line[1][0]) / 2)
+        ref_wall = target_val
+    elif REFERENCE_WALL == 'W':
+        # Westwand: niedrigstes durchschnittliches X
+        target_val = min(lines, key=lambda line: (line[0][0] + line[1][0]) / 2)
+        ref_wall = target_val
+    else:
+        print(f"  ! Ungültige REFERENCE_WALL: {REFERENCE_WALL}. Verwende 'N'")
+        target_val = max(lines, key=lambda line: (line[0][1] + line[1][1]) / 2)
+        ref_wall = target_val
+    
+    p1, p2 = ref_wall
+    
+    # Nullpunkt soll auf der Referenzwand liegen, an der gewünschten Ecke
+    # Je nach Referenzwand und Ecke bestimmen wir den Punkt auf der Linie
+    
+    # Berechne Bounds für alle Punkte
+    all_x = [p[0] for line in lines for p in line]
+    all_y = [p[1] for line in lines for p in line]
+    x_min_all, x_max_all = min(all_x), max(all_x)
+    y_min_all, y_max_all = min(all_y), max(all_y)
+    
+    # Bestimme welcher Punkt der Referenzwand näher an der gewünschten Ecke liegt
+    if ORIGIN_CORNER == 'NE':
+        # Nordost: höchstes X und Y -> wähle Punkt mit höherem X auf der Referenzwand
+        origin = p1 if p1[0] > p2[0] else p2
+        corner_name = 'Nordost'
+    elif ORIGIN_CORNER == 'NW':
+        # Nordwest: niedrigstes X, höchstes Y -> wähle Punkt mit niedrigerem X
+        origin = p1 if p1[0] < p2[0] else p2
+        corner_name = 'Nordwest'
+    elif ORIGIN_CORNER == 'SE':
+        # Südost: höchstes X, niedrigstes Y -> wähle Punkt mit höherem X
+        origin = p1 if p1[0] > p2[0] else p2
+        corner_name = 'Südost'
+    elif ORIGIN_CORNER == 'SW':
+        # Südwest: niedrigstes X, niedrigstes Y -> wähle Punkt mit niedrigerem X
+        origin = p1 if p1[0] < p2[0] else p2
+        corner_name = 'Südwest'
+    else:
+        print(f"  ! Ungültige ORIGIN_CORNER: {ORIGIN_CORNER}. Verwende 'NE'")
+        origin = p1 if p1[0] > p2[0] else p2
+        corner_name = 'Nordost'
+    
+    # Winkel der Referenzwand zur X-Achse
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    angle = np.arctan2(dy, dx)
+    
+    # Durchschnittliche Position der Referenzwand
+    avg_x = (p1[0] + p2[0]) / 2
+    avg_y = (p1[1] + p2[1]) / 2
+    
+    reference = {
+        'ref_wall': ref_wall,
+        'origin': origin,
+        'angle': angle,
+        'p1': p1,
+        'p2': p2,
+        'ref_coord': (avg_x, avg_y),  # Für Positionierung der Referenzlinie
+        'wall_type': REFERENCE_WALL,
+        'corner_type': ORIGIN_CORNER
+    }
+    
+    print(f"  → Referenzwand: {wall_name_map.get(REFERENCE_WALL, 'Unbekannt')}")
+    print(f"  → Nullpunkt-Ecke: {corner_name} X={origin[0]:.1f}, Y={origin[1]:.1f}")
+    print(f"  → Referenzwand-Winkel: {np.degrees(angle):.2f}°")
+    
+    return reference
 
 
 def calculate_deviations(points, radius):
@@ -143,11 +272,21 @@ def calculate_deviations(points, radius):
     return np.array(deviations)
 
 
-def create_png(points, deviations, grundriss, threshold, output_path):
+def create_png(points, deviations, grundriss, threshold, output_path, north_ref=None):
     """Erstellt hochauflösende PNG-Grafik"""
     x, y, z = points[:, 0], points[:, 1], points[:, 2]
     x_min, x_max = x.min(), x.max()
     y_min, y_max = y.min(), y.max()
+    
+    # Wenn Nordwand-Referenz vorhanden, nutze diese für Nullpunkt
+    if north_ref:
+        origin = north_ref['origin']
+        ref_coord = north_ref['ref_coord']
+        wall_type = north_ref['wall_type']
+    else:
+        origin = (x_max, y_max)
+        ref_coord = ((x_min + x_max)/2, y_max)
+        wall_type = 'N'
     
     # Interpoliertes Raster für Heatmap
     grid_res = 50
@@ -181,36 +320,86 @@ def create_png(points, deviations, grundriss, threshold, output_path):
         ax.plot([start[0]/1000, end[0]/1000], [start[1]/1000, end[1]/1000], 
                 'k-', linewidth=4, zorder=20)
     
-    # Nordwand
-    ax.axhline(y=y_max/1000, color='red', linewidth=5, zorder=21)
-    ax.text((x_min + x_max)/2/1000, y_max/1000 + 0.2, 'NORDWAND (Bezug)', 
-            fontsize=16, ha='center', va='bottom', color='red', fontweight='bold')
+    # Referenzwand (Nordwand/Südwand/etc.)
+    wall_names = {'N': 'NORDWAND', 'S': 'SÜDWAND', 'E': 'OSTWAND', 'W': 'WESTWAND'}
+    wall_name = wall_names.get(wall_type, 'REFERENZWAND')
+    
+    if wall_type in ['N', 'S']:
+        # Horizontale Linie
+        ax.axhline(y=ref_coord[1]/1000, color='red', linewidth=5, zorder=21)
+        ax.text(ref_coord[0]/1000, ref_coord[1]/1000 + 0.2, f'{wall_name} (Bezug/Nullpunkt)', 
+                fontsize=16, ha='center', va='bottom', color='red', fontweight='bold')
+    else:
+        # Vertikale Linie
+        ax.axvline(x=ref_coord[0]/1000, color='red', linewidth=5, zorder=21)
+        ax.text(ref_coord[0]/1000 + 0.2, ref_coord[1]/1000, f'{wall_name} (Bezug/Nullpunkt)', 
+                fontsize=16, ha='left', va='center', color='red', fontweight='bold', rotation=90)
     
     # Nullpunkt
-    ax.plot(x_max/1000, y_max/1000, 'o', markersize=15, markerfacecolor='red', 
+    ax.plot(origin[0]/1000, origin[1]/1000, 'o', markersize=15, markerfacecolor='red', 
             markeredgecolor='darkred', markeredgewidth=2, zorder=25)
-    ax.text(x_max/1000 + 0.08, y_max/1000 + 0.08, '0,0', fontsize=12, 
+    ax.text(origin[0]/1000 + 0.08, origin[1]/1000 + 0.08, '0,0', fontsize=12, 
             color='red', fontweight='bold', zorder=25)
     
-    # 10cm Raster
-    for yy in np.arange(y_max, y_min - 100, -100):
-        if (y_max - yy) % 500 != 0:
+    # Bestimme Raster-Startpunkte für saubere 50cm/10cm Linien
+    ref_y = ref_coord[1]
+    
+    # 10cm Raster - über gesamten Raum
+    for yy in np.arange(y_min - 100, y_max + 200, 100):
+        abstand = abs(ref_y - yy)
+        is_500cm = (int(round(abstand)) % 500 == 0)
+        if not is_500cm:
             ax.axhline(y=yy/1000, color='lightgray', linewidth=0.4, alpha=0.5, zorder=4)
-    for xx in np.arange(x_max, x_min - 100, -100):
-        if (x_max - xx) % 500 != 0:
+    
+    for xx in np.arange(x_min - 100, x_max + 200, 100):
+        abstand = abs(origin[0] - xx)
+        is_500cm = (int(round(abstand)) % 500 == 0)
+        if not is_500cm:
             ax.axvline(x=xx/1000, color='lightgray', linewidth=0.4, alpha=0.5, zorder=4)
     
-    # 50cm Raster
-    for yy in np.arange(y_max, y_min - 500, -500):
-        ax.axhline(y=yy/1000, color='dimgray', linewidth=1.2, alpha=0.7, zorder=5)
-        ax.text(x_min/1000 - 0.12, yy/1000, f"{int(y_max - yy)}", 
-                fontsize=9, ha='right', va='center', color='gray')
-        ax.text(x_max/1000 + 0.12, yy/1000, f"{int(y_max - yy)}", 
-                fontsize=9, ha='left', va='center', color='gray')
-    for xx in np.arange(x_max, x_min - 500, -500):
-        ax.axvline(x=xx/1000, color='dimgray', linewidth=1.2, alpha=0.7, zorder=5)
-        ax.text(xx/1000, y_max/1000 + 0.12, f"{int(x_max - xx)}", 
-                fontsize=9, ha='center', va='bottom', color='gray')
+    # 50cm Raster mit Beschriftung - Y-Richtung (von Referenzwand)
+    # Finde erste 50cm Linie und zeichne dann alle in beide Richtungen
+    start_y = ref_y
+    # Nach unten
+    for mult in range(0, int((ref_y - y_min + 500) / 500) + 1):
+        yy = ref_y - mult * 500
+        if yy >= y_min - 100:
+            ax.axhline(y=yy/1000, color='dimgray', linewidth=1.2, alpha=0.7, zorder=5)
+            abstand = int(abs(ref_y - yy))
+            if abstand > 0:
+                ax.text(x_min/1000 - 0.12, yy/1000, f"{abstand}", 
+                        fontsize=9, ha='right', va='center', color='gray')
+                ax.text(x_max/1000 + 0.12, yy/1000, f"{abstand}", 
+                        fontsize=9, ha='left', va='center', color='gray')
+    # Nach oben
+    for mult in range(1, int((y_max - ref_y + 500) / 500) + 1):
+        yy = ref_y + mult * 500
+        if yy <= y_max + 100:
+            ax.axhline(y=yy/1000, color='dimgray', linewidth=1.2, alpha=0.7, zorder=5)
+            abstand = int(abs(ref_y - yy))
+            ax.text(x_min/1000 - 0.12, yy/1000, f"{abstand}", 
+                    fontsize=9, ha='right', va='center', color='gray')
+            ax.text(x_max/1000 + 0.12, yy/1000, f"{abstand}", 
+                    fontsize=9, ha='left', va='center', color='gray')
+    
+    # 50cm Raster mit Beschriftung - X-Richtung (von Nullpunkt-Ecke)
+    # Nach links
+    for mult in range(0, int((origin[0] - x_min + 500) / 500) + 1):
+        xx = origin[0] - mult * 500
+        if xx >= x_min - 100:
+            ax.axvline(x=xx/1000, color='dimgray', linewidth=1.2, alpha=0.7, zorder=5)
+            abstand = int(abs(origin[0] - xx))
+            if abstand > 0:
+                ax.text(xx/1000, ref_y/1000 + 0.12, f"{abstand}", 
+                        fontsize=9, ha='center', va='bottom', color='gray')
+    # Nach rechts
+    for mult in range(1, int((x_max - origin[0] + 500) / 500) + 1):
+        xx = origin[0] + mult * 500
+        if xx <= x_max + 100:
+            ax.axvline(x=xx/1000, color='dimgray', linewidth=1.2, alpha=0.7, zorder=5)
+            abstand = int(abs(origin[0] - xx))
+            ax.text(xx/1000, ref_y/1000 + 0.12, f"{abstand}", 
+                    fontsize=9, ha='center', va='bottom', color='gray')
     
     # Problemstellen markieren
     for i in range(len(points)):
@@ -247,8 +436,12 @@ def create_png(points, deviations, grundriss, threshold, output_path):
     cbar.set_label('Abweichung [mm]\n← Spachteln | Abtragen →', fontsize=12)
     
     # Legende
+    corner_names = {'NE': 'Nordost', 'NW': 'Nordwest', 'SE': 'Südost', 'SW': 'Südwest'}
+    corner_name = corner_names.get(north_ref['corner_type'] if north_ref else 'NE', 'Nordost')
+    
     legend_text = (f"AUSGLEICHSPLAN (Schwelle ±{threshold}mm)\n"
-                   f"Nullpunkt: NO-Ecke | X nach Westen | Y nach Süden\n\n"
+                   f"Nullpunkt: {corner_name}-Ecke an {wall_name} (0,0)\n"
+                   f"Maße in mm von Referenzwand\n\n"
                    f"○ ROT = ABTRAGEN (Wert = wieviel mm abschleifen)\n"
                    f"□ BLAU = SPACHTELN (Wert = wieviel mm Masse auftragen)\n\n"
                    f"Abtragen: {abtragen} Stellen (max. {max_abtragen:.1f}mm)\n"
@@ -257,7 +450,7 @@ def create_png(points, deviations, grundriss, threshold, output_path):
             verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
     
-    ax.set_title(f'BODENAUSGLEICHSPLAN\nWerte in mm | Raster: dünn=10cm, dick=50cm | Nullpunkt: NO-Ecke',
+    ax.set_title(f'BODENAUSGLEICHSPLAN\nMaße von {wall_name} | Raster: dünn=10cm, dick=50cm | Nullpunkt: {corner_name}-Ecke',
                  fontsize=18, fontweight='bold', pad=20)
     ax.set_xlabel('X [m]', fontsize=12)
     ax.set_ylabel('Y [m]', fontsize=12)
@@ -272,7 +465,7 @@ def create_png(points, deviations, grundriss, threshold, output_path):
     return abtragen, spachteln, max_abtragen, max_spachteln
 
 
-def create_dxf(points, deviations, grundriss, threshold, output_path):
+def create_dxf(points, deviations, grundriss, threshold, output_path, north_ref=None):
     """Erstellt DXF mit Layern"""
     import ezdxf
     from ezdxf.enums import TextEntityAlignment
@@ -280,6 +473,16 @@ def create_dxf(points, deviations, grundriss, threshold, output_path):
     x, y, z = points[:, 0], points[:, 1], points[:, 2]
     x_min, x_max = x.min(), x.max()
     y_min, y_max = y.min(), y.max()
+    
+    # Wenn Nordwand-Referenz vorhanden, nutze diese für Nullpunkt
+    if north_ref:
+        origin = north_ref['origin']
+        ref_coord = north_ref['ref_coord']
+        wall_type = north_ref['wall_type']
+    else:
+        origin = (x_max, y_max)
+        ref_coord = ((x_min + x_max)/2, y_max)
+        wall_type = 'N'
     
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
@@ -300,42 +503,55 @@ def create_dxf(points, deviations, grundriss, threshold, output_path):
     for start, end in grundriss:
         msp.add_line(start, end, dxfattribs={'layer': 'GRUNDRISS', 'lineweight': 70})
     
-    # Nordwand
-    msp.add_line((x_min - 300, y_max), (x_max + 300, y_max),
-                 dxfattribs={'layer': 'NORDWAND', 'lineweight': 100})
-    msp.add_text("NORDWAND (Bezug)", height=120,
-                 dxfattribs={'layer': 'NORDWAND'}
-    ).set_placement(((x_min + x_max)/2, y_max + 200), align=TextEntityAlignment.CENTER)
+    # Referenzwand
+    wall_names = {'N': 'NORDWAND', 'S': 'SÜDWAND', 'E': 'OSTWAND', 'W': 'WESTWAND'}
+    wall_name = wall_names.get(wall_type, 'REFERENZWAND')
     
-    # 10cm Raster
-    for yy in np.arange(y_max, y_min - 100, -100):
-        if (y_max - yy) % 500 != 0:
+    if wall_type in ['N', 'S']:
+        msp.add_line((x_min - 300, ref_coord[1]), (x_max + 300, ref_coord[1]),
+                     dxfattribs={'layer': 'NORDWAND', 'lineweight': 100})
+        msp.add_text(f"{wall_name} (Bezug/Nullpunkt)", height=120,
+                     dxfattribs={'layer': 'NORDWAND'}
+        ).set_placement((ref_coord[0], ref_coord[1] + 200), align=TextEntityAlignment.CENTER)
+    else:
+        msp.add_line((ref_coord[0], y_min - 300), (ref_coord[0], y_max + 300),
+                     dxfattribs={'layer': 'NORDWAND', 'lineweight': 100})
+        msp.add_text(f"{wall_name} (Bezug/Nullpunkt)", height=120,
+                     dxfattribs={'layer': 'NORDWAND'}
+        ).set_placement((ref_coord[0] + 200, ref_coord[1]), align=TextEntityAlignment.LEFT)
+    
+    # 10cm und 50cm Raster - vereinfachte Version
+    # Erzeuge Raster über gesamten Raum, Beschriftung nur an 50cm Linien
+    for yy in np.arange(y_min, y_max + 100, 100):
+        is_500 = (int(abs(ref_coord[1] - yy)) % 500 == 0)
+        if is_500:
+            msp.add_line((x_min - 100, yy), (x_max + 100, yy),
+                         dxfattribs={'layer': 'RASTER_500', 'lineweight': 30})
+            abstand = int(abs(ref_coord[1] - yy))
+            if abstand > 0:  # Nicht Nulllinie beschriften
+                msp.add_text(f"{abstand}", height=60,
+                             dxfattribs={'layer': 'BESCHRIFTUNG'}
+                ).set_placement((x_min - 150, yy), align=TextEntityAlignment.RIGHT)
+                msp.add_text(f"{abstand}", height=60,
+                             dxfattribs={'layer': 'BESCHRIFTUNG'}
+                ).set_placement((x_max + 150, yy), align=TextEntityAlignment.LEFT)
+        else:
             msp.add_line((x_min, yy), (x_max, yy),
                          dxfattribs={'layer': 'RASTER_100', 'lineweight': 9})
-    for xx in np.arange(x_max, x_min - 100, -100):
-        if (x_max - xx) % 500 != 0:
+    
+    for xx in np.arange(x_min, x_max + 100, 100):
+        is_500 = (int(abs(origin[0] - xx)) % 500 == 0)
+        if is_500:
+            msp.add_line((xx, y_min - 100), (xx, y_max + 100),
+                         dxfattribs={'layer': 'RASTER_500', 'lineweight': 30})
+            abstand = int(abs(origin[0] - xx))
+            if abstand > 0:  # Nicht Nulllinie beschriften
+                msp.add_text(f"{abstand}", height=60,
+                             dxfattribs={'layer': 'BESCHRIFTUNG'}
+                ).set_placement((xx, ref_coord[1] + 200), align=TextEntityAlignment.CENTER)
+        else:
             msp.add_line((xx, y_min), (xx, y_max),
                          dxfattribs={'layer': 'RASTER_100', 'lineweight': 9})
-    
-    # 50cm Raster
-    for yy in np.arange(y_max, y_min - 500, -500):
-        msp.add_line((x_min - 100, yy), (x_max + 100, yy),
-                     dxfattribs={'layer': 'RASTER_500', 'lineweight': 30})
-        abstand = int(y_max - yy)
-        msp.add_text(f"{abstand}", height=60,
-                     dxfattribs={'layer': 'BESCHRIFTUNG'}
-        ).set_placement((x_min - 150, yy), align=TextEntityAlignment.RIGHT)
-        msp.add_text(f"{abstand}", height=60,
-                     dxfattribs={'layer': 'BESCHRIFTUNG'}
-        ).set_placement((x_max + 150, yy), align=TextEntityAlignment.LEFT)
-    
-    for xx in np.arange(x_max, x_min - 500, -500):
-        msp.add_line((xx, y_min - 100), (xx, y_max + 100),
-                     dxfattribs={'layer': 'RASTER_500', 'lineweight': 30})
-        abstand = int(x_max - xx)
-        msp.add_text(f"{abstand}", height=60,
-                     dxfattribs={'layer': 'BESCHRIFTUNG'}
-        ).set_placement((xx, y_max + 200), align=TextEntityAlignment.CENTER)
     
     # Problemstellen
     dxf_abtragen = 0
@@ -385,9 +601,9 @@ def create_dxf(points, deviations, grundriss, threshold, output_path):
     ).set_placement((lx + 150, ly - 360), align=TextEntityAlignment.LEFT)
     
     # Nullpunkt
-    msp.add_circle((x_max, y_max), 80, dxfattribs={'layer': 'NORDWAND'})
+    msp.add_circle((origin[0], origin[1]), 80, dxfattribs={'layer': 'NORDWAND'})
     msp.add_text("0,0", height=70, dxfattribs={'layer': 'NORDWAND'}
-    ).set_placement((x_max + 120, y_max + 120), align=TextEntityAlignment.LEFT)
+    ).set_placement((origin[0] + 120, origin[1] + 120), align=TextEntityAlignment.LEFT)
     
     doc.saveas(output_path)
 
@@ -405,15 +621,20 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # DXF laden
-    print(f"\n[1/4] Lade DXF-Datei...")
+    print(f"\n[1/5] Lade DXF-Datei...")
     points, grundriss = load_dxf(INPUT_DXF)
+    
+    # Nordwand finden (für Referenz-Beschriftung)
+    print(f"\n[2/5] Finde Referenzwand für Koordinatensystem...")
+    print(f"      Einstellung: REFERENCE_WALL={REFERENCE_WALL}, ORIGIN_CORNER={ORIGIN_CORNER}")
+    north_ref = find_north_wall(grundriss)
     
     x, y, z = points[:, 0], points[:, 1], points[:, 2]
     print(f"\nRaumgröße: {(x.max()-x.min())/1000:.2f} x {(y.max()-y.min())/1000:.2f} m")
     print(f"Höhenbereich: {z.min():.1f} bis {z.max():.1f} mm (Δ {z.max()-z.min():.1f} mm)")
     
     # Abweichungen berechnen
-    print(f"\n[2/4] Berechne lokale Abweichungen (Radius: {RADIUS}mm)...")
+    print(f"\n[3/5] Berechne lokale Abweichungen (Radius: {RADIUS}mm)...")
     deviations = calculate_deviations(points, RADIUS)
     
     abtragen = np.sum(deviations > SCHWELLE)
@@ -423,27 +644,27 @@ def main():
     print(f"  Spachteln: {spachteln} Stellen (max. {abs(np.nanmin(deviations)):.1f}mm)")
     
     # Ausgaben erstellen
-    print(f"\n[3/4] Erstelle Ausgabedateien...")
+    print(f"\n[4/5] Erstelle Ausgabedateien...")
     
     if EXPORT_PNG:
         png_path = os.path.join(OUTPUT_DIR, f"ausgleichsplan_{SCHWELLE}mm.png")
-        create_png(points, deviations, grundriss, SCHWELLE, png_path)
+        create_png(points, deviations, grundriss, SCHWELLE, png_path, north_ref)
         print(f"  ✓ {png_path}")
     
     if EXPORT_PDF:
         pdf_path = os.path.join(OUTPUT_DIR, f"ausgleichsplan_{SCHWELLE}mm.pdf")
         # PDF ist identisch mit PNG, nur anderes Format
         fig = plt.figure()
-        create_png(points, deviations, grundriss, SCHWELLE, pdf_path)
+        create_png(points, deviations, grundriss, SCHWELLE, pdf_path, north_ref)
         print(f"  ✓ {pdf_path}")
     
     if EXPORT_DXF:
         dxf_path = os.path.join(OUTPUT_DIR, f"ausgleichsplan_{SCHWELLE}mm.dxf")
-        create_dxf(points, deviations, grundriss, SCHWELLE, dxf_path)
+        create_dxf(points, deviations, grundriss, SCHWELLE, dxf_path, north_ref)
         print(f"  ✓ {dxf_path}")
     
     # CSV mit allen Punkten
-    print(f"\n[4/4] Exportiere CSV...")
+    print(f"\n[5/5] Exportiere CSV...")
     csv_path = os.path.join(OUTPUT_DIR, f"alle_punkte_{SCHWELLE}mm.csv")
     with open(csv_path, 'w', encoding='utf-8') as f:
         f.write('X [m];Y [m];Ist-Höhe [mm];Abweichung [mm];Aktion\n')
